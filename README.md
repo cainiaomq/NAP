@@ -1,12 +1,6 @@
-# NAP: Noise-Aware Perception for Medical Vision-Language Models
+# NAP: Noise-Aware Perception for Visually Grounded Medical Vision-Language Models
 
-Reference implementation of **Noise-Aware Perception: Supervising the Visual Pathway of
-Medical Vision-Language Models through Noise-Level Prediction** (paper under review).
-
-This work extends [Med-CogVLM](https://github.com/cainiaomq/Med-CogVLM) (PRICAI 2026).
-Med-CogVLM constrains a deep-fusion medical VLM through visual dependency rewards on its
-generated text; NAP gives the visual pathway itself a training objective, the prediction
-of the noise level injected into the visual embedding.
+Reference implementation of Noise-Aware Perception (NAP).
 
 NAP injects graded Gaussian noise into the visual embedding and trains the model
 to report the noise level alongside its answer, using noise prediction as a
@@ -15,8 +9,6 @@ self-supervised perceptual objective for the visual pathway.
 ## Requirements
 
 ```bash
-git clone https://github.com/cainiaomq/NAP.git
-cd NAP
 pip install -r requirements.txt
 ```
 
@@ -70,7 +62,7 @@ python merge.py
 **Stage 2 — self-training.** The model samples `--num_candidates` responses per
 question, keeps the correct one with the highest visual dependency score, and
 pairs it with a randomly drawn noise level. `--use_vds False` retains a random
-correct candidate instead.
+correct candidate instead, which is the ablation without the CLIP model.
 
 ```bash
 deepspeed lora_finetune_st.py --ds_config ds_config.yaml \
@@ -92,13 +84,8 @@ deepspeed peft_grpo_duallora_v2.py --ds_config ds_config.yaml \
     --k 4 --noise_rate 0.5
 ```
 
-Ablations reported in the paper:
-
-| Configuration | Setting |
-|---|---|
-| w/o R_vec | `--w_vec 0` |
-| w/o R_np | `--w_noise_pred 0` |
-| w/o ST + R_np | `--w_noise_pred 0`, with `--model_path checkpoints/sft` (Stage 2 skipped) |
+Ablations: `--noise_rate 0` removes the noise mechanism, `--w_vec 0` removes the
+visual consistency reward.
 
 ## Evaluation
 
@@ -126,10 +113,14 @@ deepspeed scripts/lora_finetune_st_lingshu.py --ds_config ds_config.yaml
 deepspeed scripts/peft_grpo_duallora_v2_lingshu.py --ds_config ds_config.yaml
 ```
 
-## Related work
+## Revision Verification & Control Experiments (`revision_experiments/`)
 
-- **Med-CogVLM** (PRICAI 2026): [github.com/cainiaomq/Med-CogVLM](https://github.com/cainiaomq/Med-CogVLM)
+The `revision_experiments/` directory contains the additional control and validation scripts added during Round 1 revision:
 
-## License
+- `run_r39_clean_st.py` / `run_r39_grpo.py` / `eval_r39_sub2000.py`: Orthogonal ablation controls on `Sub2000` (*Clean ST w/o noise* and *Passive Noise Reg.*).
+- `exp1_mismatched_vds.py`: Same-modality (`Delta_sm`) and random cross-modality mismatched-image VDS controls across BMCA, PLIP, and UniMed-CLIP.
+- `exp2_covariance_spectra.py`: Empirical covariance spectra, effective rank, Fisher information `I_eff(t)`, and non-Gaussianity diagnostics across 200 stratified medical images.
+- `exp3_counterfactual_inference.py`: Direct counterfactual image-dependency evaluation (`Real`, `Blank`, `Shuffled`, `Same-Mod`, `n=240`) with three-CLIP `VDS_shown` vs. `VDS_true` tracking.
+- `exp4_noise_confusion_matrix.py`: Balanced six-level (`L0`–`L5`, `n=1,200`) noise-level prediction confusion matrix evaluation.
 
-This project is licensed under the Apache License 2.0.
+> **Path configuration:** Set `NAP_DATA_ROOT` / `NAP_MODEL_ROOT` (or update the top-of-file path constants) to point to your local OmniMedVQA dataset and checkpoint directories before running.

@@ -1,0 +1,357 @@
+# -*- coding: utf-8 -*-
+"""
+R3.9 Controlled 300-Step GRPO Ablation Runner (strictly mirrors peft_grpo_duallora_v2.py).
+Adds --max_steps and --prompt_mode {noise, passive} without modifying any user files.
+"""
+import argparse, os, sys, random, logging, csv, time, torch
+import numpy as np
+from typing import List
+from tqdm import tqdm
+from collections import defaultdict
+from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
+from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate.utils import HfDeepSpeedConfig
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+)
+from peft import get_peft_model, LoraConfig, TaskType
+from datetime import datetime
+
+sys.path.insert(0, "/path/to/NAP_code")
+from utils.omnimedqkv import OmniMedVQA_Dataset
+from rl.embedder import MedClipEmbedder
+from rl.rewards import build_rewards_v2, standardize_each_then_mix, group_norm_and_clip
+from rl.roi import to_pil_list
+from rl.utils import (
+    split_prompt_from_sft_batch, per_token_logps, first_eos_mask, ensure_cogvlm_images
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("r39-grpo")
+
+ALL_REWARD_NAMES = ["acc", "fmt", "noise_fmt", "noise_pred", "vec"]
+
+PASSIVE_P1 = (
+    "You are a medical doctor analyzing a clinical image. "
+    "Base your reasoning strictly on the visible evidence in the image."
+)
+PASSIVE_P2 = (
+    "You MUST respond in EXACTLY this format on a single line, with no extra text:\n"
+    "<letter>. <option text>: Evidence: <one concise sentence>\n\n"
+    "Where:\n"
+    "  - <letter> is one of A, B, C, D (your chosen option)\n"
+    "  - <option text> is the exact text of the chosen option\n"
+    "  - Evidence is ONE concise sentence describing the key visual cue supporting your choice\n\n"
+    "Output the answer line now:"
+)
+
+
+def parse_args():
+    p = argparse.ArgumentParser("R3.9 GRPO Ablation")
+    p.add_argument("--model_path", type=str, required=True)
+    p.add_argument("--dataset_path", type=str, default="/path/to/datasets/OmniMedVQA-Train")
+    p.add_argument("--save_path", type=str, required=True)
+    p.add_argument("--ds_config", type=str, default="/path/to/NAP_code/ds_config.yaml")
+    p.add_argument("--torch_type", type=str, default="torch.bfloat16")
+
+    p.add_argument("--max_input_len", type=int, default=640)
+    p.add_argument("--max_output_len", type=int, default=320)
+    p.add_argument("--train_dataset_rate", type=float, default=1.0)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--k", type=int, default=4)
+    p.add_argument("--noise_rate", type=float, default=0.5)
+    p.add_argument("--prompt_mode", type=str, choices=["noise", "passive"], default="noise")
+
+    p.add_argument("--lora_rank", type=int, default=8)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--lora_target", type=eval, default=[
+        "vision_expert_query_key_value", "vision_expert_dense",
+        "language_expert_query_key_value", "language_expert_dense",
+        "vision_mlp.gate_proj", "vision_mlp.up_proj", "vision_mlp.down_proj",
+        "language_mlp.gate_proj", "language_mlp.up_proj", "language_mlp.down_proj",
+    ])
+
+    p.add_argument("--num_epochs", type=int, default=1)
+    p.add_argument("--max_steps", type=int, default=300)
+    p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--warmup_steps", type=int, default=0)
+    p.add_argument("--save_step", type=int, default=100)
+    p.add_argument("--kl_coef", type=float, default=0.02)
+
+    p.add_argument("--w_acc", type=float, default=0.35)
+    p.add_argument("--w_fmt", type=float, default=0.10)
+    p.add_argument("--w_noise_fmt", type=float, default=0.05)
+    p.add_argument("--w_noise_pred", type=float, default=0.15)
+    p.add_argument("--w_vec", type=float, default=0.35)
+
+    p.add_argument("--visdep_sidecar", type=str, default="/path/to/datasets/OmniMedVQA/iodep_scores.jsonl")
+    p.add_argument("--visdep_min_score", type=float, default=0.35)
+    p.add_argument("--visdep_weighting", action="store_true")
+    p.add_argument("--dep_sidecar", type=str, default="/path/to/datasets/OmniMedVQA/visdep_scores.jsonl")
+    p.add_argument("--dep_min", type=float, default=0.0)
+    p.add_argument("--keep_if_dep_missing", action="store_true")
+    p.add_argument("--adv_clip", type=float, default=5.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--local_rank", type=int, default=-1)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    dtype = eval(args.torch_type)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    import yaml
+    with open(args.ds_config, "r") as f:
+        ds_cfg = yaml.safe_load(f)
+    hf_ds_config = HfDeepSpeedConfig(ds_cfg)
+    ds_plugin = DeepSpeedPlugin(hf_ds_config=hf_ds_config)
+    accelerator = Accelerator(deepspeed_plugin=ds_plugin)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "left"
+
+    base = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=dtype, trust_remote_code=True)
+
+    dataset = OmniMedVQA_Dataset(
+        root_dir=args.dataset_path, tokenizer=tokenizer, model=base,
+        torch_type=dtype, input_length=args.max_input_len,
+        output_length=args.max_output_len,
+        noise_rate=args.noise_rate,
+        use_doctor_prompt=True,
+        visdep_sidecar=args.visdep_sidecar,
+        visdep_min_score=args.visdep_min_score,
+        visdep_weighting=args.visdep_weighting,
+        dep_sidecar=args.dep_sidecar, dep_min=args.dep_min,
+        keep_if_dep_missing=args.keep_if_dep_missing,
+    )
+    if args.prompt_mode == "passive":
+        dataset.doctor_prompt1 = PASSIVE_P1
+        dataset.doctor_prompt2 = PASSIVE_P2
+        logger.info("[R3.9] Using PASSIVE non-noise doctor prompt (no <noise> tags)")
+    else:
+        logger.info("[R3.9] Using standard NOISE-AWARE doctor prompt")
+
+    total = len(dataset)
+    train_size = int(args.train_dataset_rate * total)
+    val_size = total - train_size
+    g = torch.Generator().manual_seed(args.seed)
+    train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=g)
+
+    subset_indices = train_ds.indices
+    scores = torch.tensor([dataset.samples[i]['visdep_score'] for i in subset_indices], dtype=torch.float32)
+    weights = (0.5 + 0.5 * scores).pow(2.0)
+    sampler = WeightedRandomSampler(weights=weights, num_samples=len(subset_indices), replacement=True, generator=g)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, collate_fn=dataset.custom_collate_fn)
+
+    lcfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM, r=args.lora_rank,
+        lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+        target_modules=args.lora_target, inference_mode=False, modules_to_save=["linear_proj"],
+    )
+    model = get_peft_model(base, lcfg)
+
+    logger.info(">> Loading MedCLIP embedder ...")
+    embedder = MedClipEmbedder(); embedder.eval()
+    logger.info(">> MedCLIP ready.")
+
+    optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optim, num_warmup_steps=args.warmup_steps,
+        num_training_steps=len(train_loader) * args.num_epochs,
+    )
+    model, optim, train_loader, lr_scheduler = accelerator.prepare(
+        model, optim, train_loader, lr_scheduler
+    )
+    os.makedirs(args.save_path, exist_ok=True)
+
+    def set_seed_time(step=0, i=0):
+        seed = time.time_ns() ^ os.getpid() ^ (step * 0x9E3779B1) ^ (i * 0x85EBCA77)
+        seed &= 0xFFFFFFFF
+        random.seed(seed); np.random.seed(seed % (2**32 - 1))
+        torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+    metrics_sum = defaultdict(float); metrics_n = 0
+    rw = {"acc": args.w_acc, "fmt": args.w_fmt, "noise_fmt": args.w_noise_fmt,
+          "noise_pred": args.w_noise_pred, "vec": args.w_vec}
+
+    csv_path = os.path.join(args.save_path, "train_metrics.csv")
+    if accelerator.is_main_process:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            header = [
+                "wall_time", "step_global", "loss_mean", "kl_mean", "r_mean_mean",
+                "noise_ratio_mean", "np_nonzero_var_ratio",
+            ] + [f"parts_{n}_mean" for n in ALL_REWARD_NAMES]
+            w.writerow(header)
+
+    step_global = 0
+    model.train()
+    for step, batch in enumerate(tqdm(train_loader, total=args.max_steps, desc="R3.9 GRPO")):
+        step_global += 1
+
+        prompts, prompt_attn, prompt_lens, images_raw, extra = split_prompt_from_sft_batch(batch, tokenizer)
+        prompt_tti = extra.get("prompt_token_type_ids", None)
+        B, P = prompts.size(0), prompts.size(1)
+        device = accelerator.device
+
+        noise_levels_tensor = batch.get("noise_level", None)
+        noise_levels = [int(nl) for nl in noise_levels_tensor] if noise_levels_tensor is not None else [0] * B
+
+        if images_raw is None:
+            images_for_gen = None
+            tti_for_gen = torch.zeros_like(prompts, device=device)
+            images_clean_pil = None
+        else:
+            images_for_gen = ensure_cogvlm_images(images_raw, device, dtype)
+            tti_for_gen = prompt_tti.to(device)
+            images_clean_pil = to_pil_list(images_raw)
+
+        gen_inputs = {
+            "input_ids": prompts.to(device),
+            "token_type_ids": tti_for_gen,
+            "attention_mask": prompt_attn.to(device),
+            "images": images_for_gen,
+        }
+        gen_kwargs = {
+            "max_new_tokens": args.max_output_len,
+            "pad_token_id": tokenizer.pad_token_id or 0,
+            "top_p": 0.95, "temperature": 1.0, "do_sample": True,
+            "noise_level": noise_levels,
+        }
+
+        completions_ids = []
+        with torch.no_grad():
+            for i in range(args.k):
+                set_seed_time(step_global, i)
+                outputs = accelerator.unwrap_model(model).generate(**gen_inputs, **gen_kwargs)
+                completions_ids.append(outputs[:, P:])
+
+        eos_id = tokenizer.eos_token_id or tokenizer.sep_token_id or tokenizer.pad_token_id or 0
+        Lmax = max(c.size(1) for c in completions_ids) if completions_ids else 1
+        comp_padded = []
+        for c in completions_ids:
+            if c.size(1) < Lmax:
+                comp_padded.append(torch.cat([c, c.new_full((c.size(0), Lmax - c.size(1)), eos_id)], dim=1))
+            else:
+                comp_padded.append(c)
+        comp_cat = torch.cat(comp_padded, dim=0)
+        comp_mask = first_eos_mask(comp_cat, eos_id=eos_id).to(prompts.dtype)
+        comp_texts: List[str] = [tokenizer.decode(row, skip_special_tokens=True).strip() for row in comp_cat]
+
+        prompts_k = prompts.repeat(args.k, 1)
+        prompt_attn_k = prompt_attn.repeat(args.k, 1)
+        prompt_tti_k = (torch.zeros_like(prompts_k, device=device) if images_raw is None
+                        else prompt_tti.repeat(args.k, 1).to(device))
+        comp_tti = torch.zeros_like(comp_cat, device=device)
+        pc_ids = torch.cat([prompts_k, comp_cat.to(device)], dim=1)
+        pc_attn = torch.cat([prompt_attn_k.to(device), comp_mask.to(device)], dim=1)
+        pc_tti = torch.cat([prompt_tti_k, comp_tti], dim=1)
+
+        if images_for_gen is None:
+            images_k = None
+        elif isinstance(images_for_gen, list):
+            images_k = []
+            for _ in range(args.k):
+                images_k.extend(images_for_gen)
+        else:
+            images_k = [images_for_gen] * args.k
+
+        start = max(P - 1, 0)
+        logp_actor = per_token_logps(
+            model, input_ids=pc_ids, attention_mask=pc_attn,
+            images=images_k, use_cache=False, token_type_ids=pc_tti
+        )[:, start:]
+
+        with torch.no_grad():
+            kl_coef = float(args.kl_coef)
+            with accelerator.unwrap_model(model).disable_adapter():
+                logp_ref = per_token_logps(
+                    model, input_ids=pc_ids, attention_mask=pc_attn,
+                    images=images_k, use_cache=False, token_type_ids=pc_tti
+                )[:, start:]
+
+        per_tok_kl = (torch.exp(logp_ref - logp_actor) - (logp_ref - logp_actor) - 1.0) if kl_coef > 0 else torch.zeros_like(logp_actor)
+
+        gold_texts = batch.get("answer_text", None) or [""] * B
+        question_id = batch.get("question_id", None) or [""] * B
+
+        reward_dict = build_rewards_v2(
+            pred_texts=comp_texts,
+            gold_texts=gold_texts,
+            question_id=question_id,
+            true_noise_levels=noise_levels,
+            embedder=embedder,
+            images_clean=images_clean_pil,
+            B=B, K=args.k, device=device,
+            w_acc=args.w_acc, w_fmt=args.w_fmt,
+            w_noise_fmt=args.w_noise_fmt, w_noise_pred=args.w_noise_pred,
+            w_vec=args.w_vec,
+        )
+
+        np_r = reward_dict.get("noise_pred")
+        if np_r is not None and float(np_r.std().item()) > 1e-6:
+            metrics_sum["np_nonzero_var"] += 1.0
+
+        _to_dev = lambda x: None if x is None else x.to(device)
+        parts_input = {n: (_to_dev(reward_dict.get(n)), rw[n]) for n in ALL_REWARD_NAMES}
+        rewards_mix, parts_log = standardize_each_then_mix(parts_input)
+        advantages = group_norm_and_clip(rewards_mix, clip=args.adv_clip)
+        adv_flat = advantages.reshape(B * args.k, 1)
+
+        imp_weight = torch.exp(logp_actor - logp_actor.detach())
+        per_token_loss = -(imp_weight * adv_flat - kl_coef * per_tok_kl)
+        comp_mask_f = comp_mask.to(per_token_loss.dtype)
+        loss = ((per_token_loss * comp_mask_f).sum(1) / (comp_mask_f.sum(1) + 1e-8)).mean()
+
+        optim.zero_grad(set_to_none=True)
+        accelerator.backward(loss)
+        optim.step(); lr_scheduler.step()
+
+        with torch.no_grad():
+            mean_kl = (((per_tok_kl * comp_mask_f).sum(1) / (comp_mask_f.sum(1) + 1e-8)).mean().item() if kl_coef > 0 else 0.0)
+            r_mean = rewards_mix.mean().item()
+
+        metrics_sum["loss"] += float(loss.item())
+        metrics_sum["kl"] += float(mean_kl)
+        metrics_sum["r_mean"] += float(r_mean)
+        for n in ALL_REWARD_NAMES:
+            metrics_sum[f"r_{n}"] += float(parts_log.get(n, 0.0))
+        metrics_sum["noise_count"] += sum(1 for nl in noise_levels if nl > 0)
+        metrics_sum["batch_size"] += B
+        metrics_n += 1
+
+        if step_global % 50 == 0 or step_global == args.max_steps:
+            avg = {k: v / max(metrics_n, 1) for k, v in metrics_sum.items() if k not in ("noise_count", "batch_size")}
+            noise_ratio = metrics_sum["noise_count"] / max(metrics_sum["batch_size"], 1)
+            parts_str = " | ".join(f"{n}={avg.get(f'r_{n}', 0):.4f}" for n in ALL_REWARD_NAMES)
+            logger.info(f"[R3.9 step {step_global}/{args.max_steps}] loss={avg['loss']:.5f} kl={avg['kl']:.5f} noise={noise_ratio:.2%} np_var={avg.get('np_nonzero_var',0):.2%} | {parts_str}")
+            if accelerator.is_main_process:
+                with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    row = [time.time(), step_global, avg["loss"], avg["kl"], avg["r_mean"], noise_ratio, avg.get("np_nonzero_var", 0.0)]
+                    row += [avg.get(f"r_{n}", 0.0) for n in ALL_REWARD_NAMES]
+                    w.writerow(row)
+            metrics_sum.clear()
+            metrics_n = 0
+
+        if step_global % args.save_step == 0 or step_global == args.max_steps:
+            ckpt = os.path.join(args.save_path, f"checkpoint_step_{step_global}")
+            os.makedirs(ckpt, exist_ok=True)
+            accelerator.unwrap_model(model).save_pretrained(ckpt, safe_serialization=True)
+            logger.info(f"[R3.9] Saved adapter checkpoint -> {ckpt}")
+
+        if step_global >= args.max_steps:
+            break
+
+    logger.info(f"[R3.9] Training DONE ({step_global} steps).")
+
+
+if __name__ == "__main__":
+    main()
